@@ -74,159 +74,50 @@ $telegramChatId = getenv('TG_BOT_CHAT_ID');
 
 sendTelegramMessage('Building started...', $telegramBotToken, $telegramChatId, $logFile);
 
-function buildDeleteCmd(array $paths): string {
-    $rmRf = [];
-    $rmF = [];
-    foreach ($paths as $path) {
-        if (strpos($path, '*') !== false) {
-            $rmF[] = $path;
-        } else {
-            $rmRf[] = escapeshellarg($path);
-        }
-    }
-    $parts = [];
-    if ($rmRf) {
-        $parts[] = 'sudo rm -rf ' . implode(' ', $rmRf);
-    }
-    if ($rmF) {
-        $parts[] = 'sudo rm -f ' . implode(' ', $rmF);
-    }
-    return implode(' && ', $parts);
-}
-
-// Files/folders to remove in lb_sk (loadbalancer branch)
-$removePaths = [
-    'bin/install/*.tar.gz',
-    'admin',
-    'includes/cli/cache_handler.php',
-    'includes/pages',
-    'includes/js',
-    'includes/lang',
-    'includes/styles',
-    'crons/backups.php',
-    'crons/cache_engine.php',
-    'crons/epg.php',
-    'crons/plex.php',
-    'crons/providers.php',
-    'crons/root_mysql.php',
-    'crons/series.php',
-    'crons/tmdb.php',
-    'crons/tmdb_popular.php',
-    'www/streams/auth.php',
-    'www/playlist.php',
-    'reseller',
-    'player',
-    'ministra',
-    'tools',
-    'log.txt',
-];
-// Files/folders to remove in db_sk (database branch)
-$removePaths1 = [
-    'bin/install/*.tar.gz',
-    'admin',
-    'includes/cli/cache_handler.php',
-    'includes/pages',
-    'includes/js',
-    'includes/lang',
-    'includes/styles',
-    'crons/cache_engine.php',
-    'www/streams',
-    'www/api.php',
-    'www/enigma2.php',
-    'www/epg.php',
-    'www/player_api.php',
-    'www/playlist.php',
-    'www/probe.php',
-    'www/progress.php',
-    'www/xplugin.php',
-    'reseller',
-    'player',
-    'tools',
-    'ministra',
-    'log.txt',
-];
-
-
-
 logMessage("=== START EXECUTION ===", $logFile);
 
 logMessage("=== RUNNING PRE-COMMAND ===", $logFile);
 
-// Build delete command safely
-$deleteCmd = buildDeleteCmd($removePaths);
-$deleteCmd1 = buildDeleteCmd($removePaths1);
-$commitMsg = date('Y-m-d-H-i-s');
-
+// Sync the three source checkouts. No more derived lb_sk/db_sk branches:
+// xui_lb now tracks its own independent branch, and db.tar.gz is no longer built here.
 $preCommand = "
-cd /home/xui && \
+cd /home/install_progress/xui && \
 sudo git fetch --all && \
-sudo git checkout ubuntu20 && \
+sudo git checkout sprite && \
 sudo git pull && \
-if ! sudo git -C /home/xui_lb rev-parse --git-dir >/dev/null 2>&1; then \
-  if [ -e /home/xui_lb ]; then echo 'ERROR: /home/xui_lb exists but is not a git worktree' >&2; exit 1; fi; \
-  sudo git worktree add /home/xui_lb lb_sk; \
-fi && \
-if ! sudo git -C /home/xui_db rev-parse --git-dir >/dev/null 2>&1; then \
-  if [ -e /home/xui_db ]; then echo 'ERROR: /home/xui_db exists but is not a git worktree' >&2; exit 1; fi; \
-  sudo git worktree add /home/xui_db db_sk; \
-fi && \
-sudo rsync -a --delete --filter='protect .git/' --exclude='.git' --exclude='bin/install/*.tar.gz' /home/xui/ /home/xui_lb/ && \
-sudo rsync -a --delete --filter='protect .git/' --exclude='.git' --exclude='bin/install/*.tar.gz' /home/xui/ /home/xui_db/ && \
-cd /home/xui_lb && \
-sudo git checkout lb_sk && \
-sudo $deleteCmd && \
-sudo git add -A && \
-(sudo git diff --cached --quiet || sudo git commit -m '$commitMsg') && \
-sudo git push origin lb_sk && \
-cd /home/xui_db && \
-sudo git checkout db_sk && \
-sudo $deleteCmd1 && \
-sudo git add -A && \
-(sudo git diff --cached --quiet || sudo git commit -m '$commitMsg') && \
-sudo git push origin db_sk
+cd /home/install_progress/xui_lb && \
+sudo git fetch --all && \
+sudo git checkout new_lb && \
+sudo git pull && \
+cd /home/install_progress/xui_bin_git && \
+sudo git fetch --all && \
+sudo git checkout xui_bin && \
+sudo git pull
 ";
 
 $mainCommand = <<<'SH'
 bash -lc 'set -euo pipefail
 
-SRC=/home/xui
-OUT=/home/build/main
-WORKDIR=$(mktemp -d)
-STAGE="$WORKDIR/stage"
-ENCODED="$WORKDIR/encoded"
+STAGING=/home/install_progress
 IONCUBE=/home/ioncube/ioncube_encoder.sh
+WORKDIR=$(mktemp -d)
 
 cleanup() { rm -rf "$WORKDIR"; }
 trap cleanup EXIT
 
-mkdir -p "$OUT"
+# ---- MAIN (xui/, sprite branch) ----
+tar -czf "$STAGING/main_dev.tar.gz" -C "$STAGING/xui" .
 
-stage_main_tree() {
-  local dest="$1"
-  mkdir -p "$dest"
-  local d
-  for d in bin backups content config tmp admin crons includes ministra player reseller www .git; do
-    rsync -a "$SRC/$d/" "$dest/$d/"
-  done
-  cp -a "$SRC/status" "$SRC/tools" "$SRC/service" "$SRC/.gitignore" "$dest/"
-}
-
-stage_main_tree "$STAGE"
-
-tar -czf "$OUT/main_dev.tar.gz" -C "$STAGE" .
-
-# Prod encode: separate tree without .git / .gitignore (--ignore is unreliable for .git)
 STAGE_ENCODE="$WORKDIR/stage_encode"
-rsync -a "$STAGE/" "$STAGE_ENCODE/" --exclude='.git'
+rsync -a "$STAGING/xui/" "$STAGE_ENCODE/" --exclude=".git"
 rm -f "$STAGE_ENCODE/.gitignore"
 
+ENCODED="$WORKDIR/encoded"
 "$IONCUBE" -74 "$STAGE_ENCODE" -o "$ENCODED" \
-  --copy "bin/" \
   --copy "backups/" \
   --copy "content/" \
   --copy "config/" \
   --copy "tmp/" \
-  --copy "service" \
   --copy "includes/libs/" \
   --copy "includes/js/" \
   --copy "includes/styles/" \
@@ -239,24 +130,46 @@ rm -f "$STAGE_ENCODE/.gitignore"
 rm -rf "$ENCODED/.git"
 rm -f "$ENCODED/.gitignore"
 
-tar -czf "$OUT/main.tar.gz" -C "$ENCODED" .
+tar -czf "$STAGING/main.tar.gz" -C "$ENCODED" .
 
+# ---- LOADBALANCER (xui_lb/, new_lb branch) ----
+tar -czf "$STAGING/loadbalancer.tar.gz" -C "$STAGING/xui_lb" --exclude=".git" --exclude=".gitignore" .
+tar -czf "$STAGING/loadbalancer_dev.tar.gz" -C "$STAGING/xui_lb" .
+
+# ---- BINARIES: binaries.tar.gz is the persistent base (real compiled binaries);
+# only the "service" script gets refreshed from xui_bin_git on every build. ----
+rm -rf "$STAGING/xui_bin"
+mkdir -p "$STAGING/xui_bin"
+tar -xzf "$STAGING/binaries.tar.gz" -C "$STAGING/xui_bin"
+cp -a "$STAGING/xui_bin_git/service" "$STAGING/xui_bin/service"
+chmod +x "$STAGING/xui_bin/service"
+tar -czf "$STAGING/binaries.tar.gz" -C "$STAGING/xui_bin" .
+
+# ---- FINAL BUNDLES: binaries.tar.gz, database.sql, install, xds*, loadbalancer.tar.gz + main ----
 build_xui_install_bundle() {
-  local bundle_out="$1" main_archive="$2" main_name="$3"
-  local tmp f
+  local bundle_out="$1" main_archive="$2" main_name="$3" lb_archive="$4"
+  local tmp f base
   tmp=$(mktemp -d)
-  for f in /home/build/*; do
-    if [ -f "$f" ]; then
-      cp -a "$f" "$tmp/"
-    fi
+  for f in "$STAGING"/*; do
+    [ -f "$f" ] || continue
+    base=$(basename "$f")
+    case "$base" in
+      main.tar.gz|main_dev.tar.gz|xui_install.tar.gz|xui_install_dev.tar.gz|loadbalancer.tar.gz|loadbalancer_dev.tar.gz) continue ;;
+    esac
+    cp -a "$f" "$tmp/"
   done
   cp -a "$main_archive" "$tmp/$main_name"
+  cp -a "$lb_archive" "$tmp/loadbalancer.tar.gz"
   tar -czf "$bundle_out" -C "$tmp" .
   rm -rf "$tmp"
 }
 
-build_xui_install_bundle /home/xui_install.tar.gz "$OUT/main.tar.gz" main.tar.gz
-build_xui_install_bundle /home/xui_install_dev.tar.gz "$OUT/main_dev.tar.gz" main.tar.gz
+build_xui_install_bundle "$WORKDIR/xui_install.tar.gz" "$STAGING/main.tar.gz" main.tar.gz "$STAGING/loadbalancer.tar.gz"
+build_xui_install_bundle "$WORKDIR/xui_install_dev.tar.gz" "$STAGING/main_dev.tar.gz" main.tar.gz "$STAGING/loadbalancer_dev.tar.gz"
+
+# ---- Publish the final bundles to /home ----
+mv -f "$WORKDIR/xui_install.tar.gz" /home/xui_install.tar.gz
+mv -f "$WORKDIR/xui_install_dev.tar.gz" /home/xui_install_dev.tar.gz
 '
 SH;
 

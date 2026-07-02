@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Installer script
-# Downloads file from http://103.161.35.57/xui_installer.php
+# Downloads file from http://basketball022.space/xui_installer_dev.php
 # Extracts it using tar -xzf
 # Runs the extracted install script
 
@@ -78,37 +78,12 @@ fi
 print_status "Extraction completed"
 
 
-# Build db.tar.gz and loadbalancer.tar.gz from main.tar.gz (same paths as xui_repo_worker).
+# Build db.tar.gz from main.tar.gz (same paths as xui_repo_worker).
+# loadbalancer.tar.gz is already included in xui_installer.tar.gz, so it's not rebuilt here.
 if [ ! -f "main.tar.gz" ]; then
     print_error "main.tar.gz not found after extraction"
     exit 1
 fi
-
-LOADBALANCER_REMOVES=(
-    'bin/install/*.tar.gz'
-    'admin'
-    'includes/cli/cache_handler.php'
-    'includes/pages'
-    'includes/js'
-    'includes/lang'
-    'includes/styles'
-    'crons/backups.php'
-    'crons/cache_engine.php'
-    'crons/epg.php'
-    'crons/plex.php'
-    'crons/providers.php'
-    'crons/root_mysql.php'
-    'crons/series.php'
-    'crons/tmdb.php'
-    'crons/tmdb_popular.php'
-    'www/streams/auth.php'
-    'www/playlist.php'
-    'reseller'
-    'player'
-    'ministra'
-    'tools'
-    'log.txt'
-)
 
 DB_REMOVES=(
     'bin/install/*.tar.gz'
@@ -158,13 +133,10 @@ build_variant_tarball() {
     rm -rf "$work"
 }
 
-print_status "Building loadbalancer.tar.gz from main.tar.gz..."
-build_variant_tarball "loadbalancer.tar.gz" "${LOADBALANCER_REMOVES[@]}"
-
 print_status "Building db.tar.gz from main.tar.gz..."
 build_variant_tarball "db.tar.gz" "${DB_REMOVES[@]}"
 
-print_status "db.tar.gz and loadbalancer.tar.gz built from main.tar.gz"
+print_status "db.tar.gz built from main.tar.gz"
 
 # Find the extracted install script
 # Look for common script names
