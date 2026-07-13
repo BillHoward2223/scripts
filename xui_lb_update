@@ -1,0 +1,129 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# Install server (same API as install/index.php).
+INSTALL_URL="${INSTALL_URL:-https://install.supportxui.com}"
+WORKDIR="/tmp/xui_lb_update_$$"
+TARGET="/home/xui_lb"
+PACKAGE="lb"
+PACKAGE_FILE="loadbalancer.tar.gz"
+
+mkdir -p "$WORKDIR"
+trap 'rm -rf "$WORKDIR"' EXIT
+
+echo "[+] Fetching $PACKAGE manifest from $INSTALL_URL ..."
+MANIFEST_JSON=$(curl -fsSL \
+	--connect-timeout 30 \
+	--max-time 120 \
+	-A "XUI-LB-Update/1.0" \
+	"${INSTALL_URL%/}/?package=${PACKAGE}")
+
+MANIFEST_FILE="$WORKDIR/manifest.json"
+printf '%s' "$MANIFEST_JSON" > "$MANIFEST_FILE"
+
+if ! php -r '
+$m = json_decode(file_get_contents($argv[1]), true);
+if (!is_array($m) || !empty($m["error"]) || empty($m["md5"])) {
+	fwrite(STDERR, "Invalid manifest\n");
+	exit(1);
+}
+# Prefer MD5 download URL so nginx static files cannot shadow packages/.
+echo ($m["download"] ?? $m["url"] ?? "") . "\n";
+echo $m["md5"] . "\n";
+echo ($m["version"] ?? "") . "\n";
+echo intval($m["revision"] ?? 0) . "\n";
+echo intval($m["size"] ?? 0) . "\n";
+' "$MANIFEST_FILE" > "$WORKDIR/manifest.fields"; then
+	echo "[-] Failed to parse install-server manifest"
+	exit 1
+fi
+
+mapfile -t MANIFEST_FIELDS < "$WORKDIR/manifest.fields"
+DOWNLOAD_URL="${MANIFEST_FIELDS[0]:-}"
+EXPECTED_MD5="${MANIFEST_FIELDS[1]:-}"
+REMOTE_VERSION="${MANIFEST_FIELDS[2]:-}"
+REMOTE_REVISION="${MANIFEST_FIELDS[3]:-0}"
+REMOTE_SIZE="${MANIFEST_FIELDS[4]:-0}"
+
+if [ -z "$DOWNLOAD_URL" ]; then
+	if [ -n "$EXPECTED_MD5" ]; then
+		DOWNLOAD_URL="${INSTALL_URL%/}/${EXPECTED_MD5}"
+	else
+		DOWNLOAD_URL="${INSTALL_URL%/}/${PACKAGE_FILE}"
+	fi
+fi
+
+RELEASE_LABEL="v${REMOTE_VERSION}"
+if [ "${REMOTE_REVISION}" -gt 0 ] 2>/dev/null; then
+	RELEASE_LABEL="${RELEASE_LABEL} R${REMOTE_REVISION}"
+fi
+
+echo "[+] Available: ${RELEASE_LABEL} (md5=${EXPECTED_MD5}, size=${REMOTE_SIZE})"
+echo "[+] Downloading $PACKAGE_FILE ..."
+echo "    $DOWNLOAD_URL"
+
+LB_TAR="$WORKDIR/$PACKAGE_FILE"
+curl -fL \
+	--connect-timeout 30 \
+	--max-time 7200 \
+	-A "XUI-LB-Update/1.0" \
+	-o "$LB_TAR" \
+	"$DOWNLOAD_URL"
+
+if [ ! -s "$LB_TAR" ]; then
+	echo "[-] Download failed or empty file"
+	exit 1
+fi
+
+ACTUAL_SIZE=$(stat -c%s "$LB_TAR")
+if [ "${REMOTE_SIZE}" -gt 0 ] 2>/dev/null && [ "$ACTUAL_SIZE" -ne "$REMOTE_SIZE" ]; then
+	echo "[-] Size mismatch: expected ${REMOTE_SIZE}, got ${ACTUAL_SIZE}"
+	echo "    URL may be serving a different file than packages/ (try MD5 download path)."
+	exit 1
+fi
+
+ACTUAL_MD5=$(md5sum "$LB_TAR" | awk '{print $1}')
+if [ -n "$EXPECTED_MD5" ] && [ "$ACTUAL_MD5" != "$EXPECTED_MD5" ]; then
+	echo "[-] MD5 mismatch: expected $EXPECTED_MD5, got $ACTUAL_MD5"
+	exit 1
+fi
+
+echo "[+] Download verified (md5=$ACTUAL_MD5)"
+
+echo "[+] Extracting $PACKAGE_FILE ..."
+mkdir -p "$WORKDIR/lb"
+tar -xzf "$LB_TAR" -C "$WORKDIR/lb"
+
+if [ ! -d "$TARGET" ]; then
+	echo "[-] Target directory not found: $TARGET"
+	exit 1
+fi
+
+echo "[+] Syncing into $TARGET (preserving conf/, content/, signals/, tmp/, www/images/)..."
+RSYNC_LOG="$WORKDIR/rsync.log"
+
+rsync -av \
+	--exclude='config/' \
+	--exclude='content/' \
+	--exclude='signals/' \
+	--exclude='tmp/' \
+	--exclude='www/images/' \
+	--exclude='.git/' \
+	--itemize-changes \
+	"$WORKDIR/lb/" \
+	"$TARGET/" | tee "$RSYNC_LOG"
+
+echo "[+] Fixing ownership..."
+chown -R xui:xui "$TARGET"
+
+echo
+echo "[+] Updated files:"
+grep '^>f' "$RSYNC_LOG" | awk '{print $2}' || true
+
+echo
+echo "[+] New directories:"
+grep '^cd' "$RSYNC_LOG" | awk '{print $2}' || true
+
+echo
+echo "[+] Update completed successfully (${RELEASE_LABEL})."

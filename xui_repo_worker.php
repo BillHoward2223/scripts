@@ -82,14 +82,17 @@ logMessage("=== RUNNING PRE-COMMAND ===", $logFile);
 // xui_lb now tracks its own independent branch, and db.tar.gz is no longer built here.
 $preCommand = "
 cd /home/install_progress/xui && \
+sudo git stash && \
 sudo git fetch --all && \
 sudo git checkout sprite && \
 sudo git pull && \
 cd /home/install_progress/xui_lb && \
+sudo git stash && \
 sudo git fetch --all && \
 sudo git checkout new_lb && \
 sudo git pull && \
-cd /home/install_progress/xui_bin_git && \
+cd /home/install_progress/xui_bin && \
+sudo git stash && \
 sudo git fetch --all && \
 sudo git checkout xui_bin && \
 sudo git pull
@@ -133,21 +136,38 @@ rm -f "$ENCODED/.gitignore"
 tar -czf "$STAGING/main.tar.gz" -C "$ENCODED" .
 
 # ---- LOADBALANCER (xui_lb/, new_lb branch) ----
-tar -czf "$STAGING/loadbalancer.tar.gz" -C "$STAGING/xui_lb" --exclude=".git" --exclude=".gitignore" .
+LB_STAGE_ENCODE="$WORKDIR/lb_stage_encode"
+rsync -a "$STAGING/xui_lb/" "$LB_STAGE_ENCODE/" --exclude=".git"
+rm -f "$LB_STAGE_ENCODE/.gitignore"
+
+LB_ENCODED="$WORKDIR/lb_encoded"
+"$IONCUBE" -74 "$LB_STAGE_ENCODE" -o "$LB_ENCODED" \
+  --copy "config/" \
+  --copy "content/" \
+  --copy "tmp/" \
+  --copy "includes/libs/" \
+  --copy "includes/python/" \
+  --encode "status" \
+  --encode "tools" \
+  --ignore "*.sock"
+
+rm -rf "$LB_ENCODED/.git"
+rm -f "$LB_ENCODED/.gitignore"
+
+tar -czf "$STAGING/loadbalancer.tar.gz" -C "$LB_ENCODED" .
+
 tar -czf "$STAGING/loadbalancer_dev.tar.gz" -C "$STAGING/xui_lb" .
 
 # ---- BINARIES: binaries.tar.gz is the persistent base (real compiled binaries);
-# only the "service" script gets refreshed from xui_bin_git on every build. ----
 rm -rf "$STAGING/xui_bin"
 mkdir -p "$STAGING/xui_bin"
 tar -xzf "$STAGING/binaries.tar.gz" -C "$STAGING/xui_bin"
-cp -a "$STAGING/xui_bin_git/service" "$STAGING/xui_bin/service"
 chmod +x "$STAGING/xui_bin/service"
 tar -czf "$STAGING/binaries.tar.gz" -C "$STAGING/xui_bin" .
 
 # ---- FINAL BUNDLES: binaries.tar.gz, database.sql, install, xds*, loadbalancer.tar.gz + main ----
 build_xui_install_bundle() {
-  local bundle_out="$1" main_archive="$2" main_name="$3" lb_archive="$4"
+  local bundle_out="$1" main_archive="$2" main_name="$3" lb_archive="$4" strip_git_bin="${5:-0}"
   local tmp f base
   tmp=$(mktemp -d)
   for f in "$STAGING"/*; do
@@ -155,6 +175,18 @@ build_xui_install_bundle() {
     base=$(basename "$f")
     case "$base" in
       main.tar.gz|main_dev.tar.gz|xui_install.tar.gz|xui_install_dev.tar.gz|loadbalancer.tar.gz|loadbalancer_dev.tar.gz) continue ;;
+      binaries.tar.gz)
+        if [ "$strip_git_bin" = "1" ]; then
+          local bin_tmp
+          bin_tmp=$(mktemp -d)
+          tar -xzf "$f" -C "$bin_tmp"
+          rm -rf "$bin_tmp/.git"
+          rm -f "$bin_tmp/.gitignore"
+          tar -czf "$tmp/binaries.tar.gz" -C "$bin_tmp" .
+          rm -rf "$bin_tmp"
+          continue
+        fi
+        ;;
     esac
     cp -a "$f" "$tmp/"
   done
@@ -164,8 +196,8 @@ build_xui_install_bundle() {
   rm -rf "$tmp"
 }
 
-build_xui_install_bundle "$WORKDIR/xui_install.tar.gz" "$STAGING/main.tar.gz" main.tar.gz "$STAGING/loadbalancer.tar.gz"
-build_xui_install_bundle "$WORKDIR/xui_install_dev.tar.gz" "$STAGING/main_dev.tar.gz" main.tar.gz "$STAGING/loadbalancer_dev.tar.gz"
+build_xui_install_bundle "$WORKDIR/xui_install.tar.gz" "$STAGING/main.tar.gz" main.tar.gz "$STAGING/loadbalancer.tar.gz" 1
+build_xui_install_bundle "$WORKDIR/xui_install_dev.tar.gz" "$STAGING/main_dev.tar.gz" main.tar.gz "$STAGING/loadbalancer_dev.tar.gz" 0
 
 # ---- Publish the final bundles to /home ----
 mv -f "$WORKDIR/xui_install.tar.gz" /home/xui_install.tar.gz
