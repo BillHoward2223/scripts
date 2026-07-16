@@ -22,7 +22,7 @@ $ioncube  = '/home/ioncube/ioncube_encoder.sh';
 $repos = [
 	['dir' => "$staging/xui",     'branch' => 'sprite'],
 	['dir' => "$staging/xui_lb",  'branch' => 'new_lb'],
-	['dir' => "$staging/xui_bin", 'branch' => 'xui_bin'],
+	// ['dir' => "$staging/xui_bin", 'branch' => 'xui_bin'],
 ];
 
 function out(string $message): void
@@ -146,7 +146,7 @@ cp -a "$PACKAGES/loadbalancer.tar.gz" "$BUNDLE/"
 cp -a "$PACKAGES/main.tar.gz" "$BUNDLE/"
 cp -a "$STAGING/database.sql" "$BUNDLE/"
 cp -a "$STAGING/install" "$BUNDLE/"
-tar -czf "$STAGING/xui_install.tar.gz" -C "$BUNDLE" .
+tar -czf "/home/install/packages/xui_install.tar.gz" -C "$BUNDLE" .
 
 echo "[+] Building xui_install_dev.tar.gz..."
 BUNDLE_DEV="$WORKDIR/xui_install_dev"
@@ -156,7 +156,7 @@ cp -a "$PACKAGES/loadbalancer_dev.tar.gz" "$BUNDLE_DEV/loadbalancer.tar.gz"
 cp -a "$PACKAGES/main_dev.tar.gz" "$BUNDLE_DEV/main.tar.gz"
 cp -a "$STAGING/database.sql" "$BUNDLE_DEV/"
 cp -a "$STAGING/install" "$BUNDLE_DEV/"
-tar -czf "$STAGING/xui_install_dev.tar.gz" -C "$BUNDLE_DEV" .
+tar -czf "/home/install/packages/xui_install_dev.tar.gz" -C "$BUNDLE_DEV" .
 
 echo "[+] Built archives:"
 ls -lh \
@@ -165,8 +165,8 @@ ls -lh \
   "$PACKAGES/loadbalancer.tar.gz" \
   "$PACKAGES/loadbalancer_dev.tar.gz" \
   "$PACKAGES/binaries.tar.gz" \
-  "$STAGING/xui_install.tar.gz" \
-  "$STAGING/xui_install_dev.tar.gz"
+  "/home/install/packages/xui_install.tar.gz" \
+  "/home/install/packages/xui_install_dev.tar.gz"
 SH;
 
 $build = str_replace(

@@ -1,0 +1,731 @@
+#!/usr/bin/python3
+"""XUI first-time bootstrap installer (Main + LB + DB on one box)."""
+import base64
+import io
+import ipaddress
+import os
+import random
+import shlex
+import socket
+import subprocess
+import sys
+import time
+import uuid
+
+if sys.version_info.major != 3:
+    print("Please run with python3.")
+    sys.exit(1)
+
+rPath = os.path.dirname(os.path.realpath(__file__))
+
+# Archives: name -> (extract dir, marker file to verify)
+ARCHIVES = (
+    ("main.tar.gz", "/home/xui", "/home/xui/status"),
+    ("loadbalancer.tar.gz", "/home/xui_lb", "/home/xui_lb/status"),
+    ("binaries.tar.gz", "/home/xui_bin", "/home/xui_bin/service"),
+)
+
+rMySQLCnfTemplate = '''# XUI
+[client]
+port                            = {mysql_port}
+socket                          = /var/run/mysqld/mysqld.sock
+
+[mysqld_safe]
+nice                            = 0
+
+[mysqld]
+user                            = mysql
+port                            = {mysql_port}
+basedir                         = /usr
+datadir                         = /var/lib/mysql
+tmpdir                          = /tmp
+lc-messages-dir                 = /usr/share/mysql
+skip-external-locking
+skip-name-resolve
+bind-address                    = 0.0.0.0
+
+key_buffer_size                 = 128M
+myisam_sort_buffer_size         = 4M
+max_allowed_packet              = 64M
+myisam-recover-options          = BACKUP
+max_length_for_sort_data        = 8192
+query_cache_limit               = 0
+query_cache_size                = 0
+query_cache_type                = 0
+expire_logs_days                = 10
+max_binlog_size                 = 100M
+max_connections                 = {max_connections}
+wait_timeout                    = 600
+interactive_timeout             = 600
+back_log                        = {back_log}
+open_files_limit                = {open_files_limit}
+innodb_open_files               = {innodb_open_files}
+max_connect_errors              = {max_connect_errors}
+table_open_cache                = {table_open_cache}
+table_definition_cache          = {table_definition_cache}
+tmp_table_size                  = 32M
+max_heap_table_size             = 32M
+
+innodb_buffer_pool_size         = {innodb_buffer_pool_size}
+innodb_buffer_pool_instances    = {innodb_buffer_pool_instances}
+innodb_read_io_threads          = {innodb_io_threads}
+innodb_write_io_threads         = {innodb_io_threads}
+innodb_thread_concurrency       = 0
+innodb_flush_log_at_trx_commit  = 0
+innodb_flush_method             = O_DIRECT
+innodb_log_file_size            = {innodb_log_file_size}
+innodb_log_buffer_size          = {innodb_log_buffer_size}
+performance_schema              = 0
+innodb-file-per-table           = 1
+innodb_io_capacity              = {innodb_io_capacity}
+innodb_io_capacity_max          = {innodb_io_capacity_max}
+innodb_flush_neighbors          = 0
+innodb_table_locks              = 0
+innodb_lock_wait_timeout        = 30
+
+sql_mode                        = "NO_ENGINE_SUBSTITUTION"
+log_error                       = /var/log/mysql/error.log
+log_output                      = FILE
+
+[mariadb]
+
+thread_cache_size               = {thread_cache_size}
+thread_handling                 = pool-of-threads
+thread_pool_size                = {thread_pool_size}
+thread_pool_idle_timeout        = 20
+thread_pool_max_threads         = {thread_pool_max_threads}
+
+[mysqldump]
+quick
+quote-names
+max_allowed_packet              = 16M
+
+[mysql]
+
+[isamchk]
+key_buffer_size                 = 16M'''
+
+rRedisConfig = (
+    "bind 0.0.0.0\nprotected-mode yes\nport 6379\ntcp-backlog 511\ntimeout 0\n"
+    "tcp-keepalive 300\ndaemonize yes\nsupervised no\n"
+    "pidfile /home/xui_bin/redis/redis-server.pid\nloglevel warning\n"
+    "logfile /home/xui_bin/redis/redis-server.log\ndatabases 1\n"
+    "requirepass #PASSWORD#\nmaxclients 655350\nsave 60 1000\n"
+    "dir /home/xui_bin/redis/\n"
+)
+
+rSysCtl = """# XUI.one
+
+net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = fq
+net.ipv4.tcp_rmem = 8192 87380 134217728
+net.ipv4.udp_rmem_min = 16384
+net.core.rmem_default = 262144
+net.core.rmem_max = 268435456
+net.ipv4.tcp_wmem = 8192 65536 134217728
+net.ipv4.udp_wmem_min = 16384
+net.core.wmem_default = 262144
+net.core.wmem_max = 268435456
+net.core.somaxconn = 1000000
+net.core.netdev_max_backlog = 250000
+net.core.optmem_max = 65535
+net.ipv4.tcp_max_tw_buckets = 1440000
+net.ipv4.tcp_max_orphans = 16384
+net.ipv4.ip_local_port_range = 2000 65000
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_keepalive_intvl = 15
+fs.file-max=20970800
+fs.nr_open=20970800
+fs.aio-max-nr=20970800
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.route.flush = 1
+net.ipv6.route.flush = 1
+"""
+
+rSystemd = (
+    "[Unit]\nSourcePath=/home/xui_bin/service\nDescription=XUI.one Panel Service\n"
+    "After=network.target\nStartLimitIntervalSec=0\n\n[Service]\nType=simple\n"
+    "User=root\nRestart=always\nRestartSec=1\nExecStart=/bin/bash /home/xui_bin/service start\n"
+    "ExecRestart=/bin/bash /home/xui_bin/service restart\nExecStop=/bin/bash /home/xui_bin/service stop\n\n"
+    "[Install]\nWantedBy=multi-user.target\n"
+)
+
+rChoice = "1234567890abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ"
+rVersions = {"20.04": "focal", "22.04": "jammy"}
+# Same app packages as main_install.php. Extra: mariadb-server (first-boot DB).
+rPackages = [
+    "mariadb-server", "cpufrequtils", "iproute2", "python-is-python3", "net-tools",
+    "dirmngr", "gpg-agent", "software-properties-common", "libcurl4", "libmcrypt4",
+    "libgeoip-dev", "libxslt1-dev", "libonig-dev", "e2fsprogs", "wget",
+    "python3", "python3-langdetect", "sysstat", "alsa-utils", "v4l-utils",
+    "certbot", "iptables-persistent", "libjpeg-dev", "libpng-dev",
+    "xz-utils", "zip", "unzip",
+]
+rRedisPort = 6379
+# server_type bits: db=1, main=2, streaming=8, vod=16
+ROLE_MAIN_DB = 1 | 2 | 8 | 16  # 27
+
+rConfig = (
+    '; XUI Configuration\n; -----------------\n;\n\n'
+    '[XUI]\nhostname    =   "%s"\nserver_id   =   %s\nuuid     =   "%s"\n\n'
+    '[DB]\ndatabase    =   "xui"\nport        =   %s\nusername    =   "%s"\npassword    =   "%s"\n\n'
+    '[XDS]\nxds_url    =   ""\nxds_auth_key    =   ""\nxds_ingest_key    =   ""\n\n'
+    '[XLS]\n'
+    'xui_support_url    =   "https://log.supportxui.com/api/save_client_logs"\n'
+    'xui_support_api_key    =   "wang2223@xui"\n\n'
+    '[EPG]\nepgcenter_url    =   "epg.supportxui.com"\nepg_token    =   "1234567890"\n\n'
+    '[Chatwoot]\nchatwoot_url    =   "https://supportxui.com"\n'
+    'chatwoot_token    =   "ed5ftGVD7gvH75VqXXmM7PdR"\n'
+)
+
+rLBConfig = (
+    '; XUI Configuration\n; -----------------\n;\n\n'
+    '[XUI]\nhostname    =   "%s"\nserver_id   =   %s\nuuid     =   "%s"\n\n'
+    '[DB]\nsqlite_static_db    =   "/home/xui_bin/sqlite_static.db"\n\n'
+    '[XDS]\nxds_url    =   ""\nxds_ingest_key    =   ""\n\n'
+    '[XLS]\n'
+    'xui_support_url    =   "https://log.supportxui.com/api/save_client_logs"\n'
+    'xui_support_api_key    =   "wang2223@xui"\n'
+)
+
+# Matches main_install.php: LB streams 90%, LB tmp 4G, Main tmp 6G
+FSTAB_RAMDISKS = (
+    "tmpfs /home/xui_lb/content/streams tmpfs defaults,noatime,nosuid,nodev,noexec,mode=1777,size=90% 0 0",
+    "tmpfs /home/xui_lb/tmp tmpfs defaults,noatime,nosuid,nodev,noexec,mode=1777,size=4G 0 0",
+    "tmpfs /home/xui/tmp tmpfs defaults,noatime,nosuid,nodev,noexec,mode=1777,size=6G 0 0",
+)
+
+
+class col:
+    OKBLUE = '\033[94m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+
+
+def generate(length=32):
+    return ''.join(random.choice(rChoice) for _ in range(length))
+
+
+def printc(text, colour=col.OKBLUE, padding=0):
+    left = max(0, int(30 - (len(text) / 2)))
+    right = max(0, 60 - left - len(text))
+    print("%s |--------------------------------------------------------------| %s" % (colour, col.ENDC))
+    for _ in range(padding):
+        print("%s |                                                              | %s" % (colour, col.ENDC))
+    print("%s | %s%s%s | %s" % (colour, " " * left, text, " " * right, col.ENDC))
+    for _ in range(padding):
+        print("%s |                                                              | %s" % (colour, col.ENDC))
+    print("%s |--------------------------------------------------------------| %s" % (colour, col.ENDC))
+    print()
+
+
+def run(cmd, check=False, capture=False):
+    kwargs = {"check": check}
+    if isinstance(cmd, str):
+        kwargs["shell"] = True
+    if capture:
+        kwargs["capture_output"] = True
+        kwargs["text"] = True
+    return subprocess.run(cmd, **kwargs)
+
+
+def run_bash(script):
+    return run(["sudo", "bash", "-c", script]).returncode == 0
+
+
+def get_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.connect(("8.8.8.8", 80))
+    return s.getsockname()[0]
+
+
+def detect_php_bin():
+    """Prefer bundled php symlink (same as main_install.php)."""
+    generic = "/home/xui_bin/php/bin/php"
+    if os.path.isfile(generic) or os.path.islink(generic):
+        return generic
+    return "/home/xui_bin/php/bin/php_7.4"
+
+
+def configure_nginx_role(role="main", http_port=80, https_port=443):
+    """Match main_install.php nginx role/ports/limit stubs."""
+    conf = "/home/xui_bin/nginx/conf"
+    script = (
+        "mkdir -p %(conf)s/roles %(conf)s/ports %(conf)s/api && "
+        "ln -sfn roles/%(role)s.conf %(conf)s/role.conf && "
+        "echo '' > %(conf)s/limit.conf && "
+        "echo '' > %(conf)s/limit_queue.conf && "
+        "echo 'listen %(http)d;' > %(conf)s/ports/http.conf && "
+        "echo 'listen %(https)d ssl;' > %(conf)s/ports/https.conf && "
+        "/home/xui_bin/nginx/sbin/nginx -t"
+        % {"conf": conf, "role": role, "http": int(http_port), "https": int(https_port)}
+    )
+    return run_bash(script)
+
+
+def write_config(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with io.open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def write_lb_whitelist(extra_ips=None):
+    """Seed Main LB API whitelist (allow listed IPs, deny all)."""
+    ips = ["127.0.0.1"]
+    for ip in extra_ips or []:
+        ip = (ip or "").strip()
+        if ip and ip not in ips:
+            try:
+                ipaddress.ip_address(ip)
+                ips.append(ip)
+            except ValueError:
+                pass
+    body = "".join("allow %s;\n" % ip for ip in ips) + "deny all;\n"
+    path = "/home/xui_bin/nginx/conf/api/lb_whitelist.conf"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_config(path, body)
+    run("sudo chown xui:xui %s 2>/dev/null || true" % path)
+    return True
+
+
+def prepare_php_fpm_stub(pools=None):
+    """Stub daemons.sh; sized on target by startup.php (main_install.php)."""
+    if pools is None:
+        pools = os.cpu_count() or 4
+    pools = max(1, int(pools))
+    lines = ["#! /bin/bash"]
+    for n in range(1, pools + 1):
+        lines.append(
+            "start-stop-daemon --start --quiet --pidfile /home/xui_bin/php/sockets/main_%d.pid"
+            " --exec /home/xui_bin/php/sbin/php-fpm -- --daemonize --fpm-config "
+            "/home/xui_bin/php/etc/main_%d.conf" % (n, n)
+        )
+    content = "\n".join(lines) + "\n"
+    b64 = base64.b64encode(content.encode()).decode()
+    # Clear shipped/stale pid+sock: start-stop-daemon refuses world-writable pidfiles.
+    script = (
+        "rm -f /home/xui_bin/php/etc/main_*.conf "
+        "/home/xui_bin/php/sockets/main_*.pid "
+        "/home/xui_bin/php/sockets/main_*.sock && "
+        "mkdir -p /home/xui_bin/php/sockets /home/xui_bin/php/var/log && "
+        "chmod 755 /home/xui_bin/php/sockets /home/xui_bin/php/var/log && "
+        "chown xui:xui /home/xui_bin/php/sockets /home/xui_bin/php/var/log && "
+        "echo '%s' | base64 -d > /home/xui_bin/daemons.sh && "
+        "chmod +x /home/xui_bin/daemons.sh" % b64
+    )
+    return run_bash(script)
+
+
+def tune_system_limits():
+    """DefaultLimitNOFILE / apparmor / unprivileged ports / rclone (main_install)."""
+    script = r"""
+set +e
+for f in /etc/systemd/system.conf /etc/systemd/user.conf; do
+  grep -q 'DefaultLimitNOFILE=1048576' "$f" 2>/dev/null || echo -e '\nDefaultLimitNOFILE=1048576' >> "$f"
+  grep -q 'DefaultLimitNOFILESoft=1048576' "$f" 2>/dev/null || echo -e '\nDefaultLimitNOFILESoft=1048576' >> "$f"
+done
+systemctl stop apparmor 2>/dev/null || true
+systemctl disable apparmor 2>/dev/null || true
+echo 'net.ipv4.ip_unprivileged_port_start=0' > /etc/sysctl.d/50-allports-nonroot.conf
+sysctl --system >/dev/null 2>&1 || true
+rclone=/home/xui_bin/tools/rclone
+if [ -x "$rclone" ]; then
+  echo "xui ALL=(root) NOPASSWD: $rclone" > /etc/sudoers.d/xui-rclone
+  chmod 440 /etc/sudoers.d/xui-rclone
+fi
+"""
+    return run_bash(script)
+
+def run_startup(which="main"):
+    """Run panel or LB startup.php to generate PHP-FPM / crontab (main_install)."""
+    php = detect_php_bin()
+    script_path = (
+        "/home/xui/includes/cli/startup.php" if which == "main"
+        else "/home/xui_lb/includes/cli/startup.php"
+    )
+    cmd = (
+        "sudo chown -R xui:xui /home/xui_bin/php /home/xui_bin/daemons.sh "
+        "/home/xui_bin/nginx/conf 2>/dev/null || true; "
+        "sudo -u xui %s %s" % (shlex.quote(php), shlex.quote(script_path))
+    )
+    return run(cmd).returncode == 0
+
+
+def extract_stack():
+    """Extract main + lb + binaries."""
+    install_dir = "/home/xui_bin/install"
+    for archive, dest, marker in ARCHIVES:
+        src = os.path.join(rPath, archive)
+        if not os.path.isfile(src):
+            printc("Missing archive: %s" % archive, col.FAIL)
+            sys.exit(1)
+        os.makedirs(dest, exist_ok=True)
+        os.makedirs(install_dir, exist_ok=True)
+        run("sudo tar -zxf %s -C %s" % (shlex.quote(src), shlex.quote(dest)), check=True)
+        run("sudo cp -f %s %s/" % (shlex.quote(src), install_dir), check=True)
+        if not os.path.isfile(marker):
+            printc("Failed to extract %s" % archive, col.FAIL)
+            sys.exit(1)
+    configure_nginx_role("main")
+
+
+def start_xui_stack():
+    cmd = (
+        "sudo mount -a >/dev/null 2>&1; "
+        "sudo setcap cap_net_bind_service=+ep /home/xui_bin/nginx/sbin/nginx; "
+        "sudo chown -R xui:xui /home/xui/tmp /home/xui_lb/content/streams "
+        "/home/xui /home/xui_bin /home/xui_lb 2>/dev/null; "
+        "sudo chmod +x /home/xui_bin/service /home/xui_bin/daemons.sh 2>/dev/null; "
+        "sudo systemctl daemon-reload; "
+        "sudo systemctl restart xuione || sudo systemctl start xuione; "
+        "sleep 3; "
+        "test -x /home/xui/status && sudo /home/xui/status >/dev/null 2>&1 || true; "
+        "test -x /home/xui_lb/status && sudo /home/xui_lb/status >/dev/null 2>&1 || true"
+    )
+    return run(cmd).returncode == 0
+
+
+def configure_php_sessions(save_path):
+    php_ini = "/home/xui_bin/php/lib/php.ini"
+    path_esc = save_path.replace("\\", "\\\\").replace("&", "\\&")
+    script = (
+        "test -f %s && sed -i 's|^session\\.save_handler = .*|session.save_handler = redis|' %s && "
+        "sed -i 's|^session\\.save_path = .*|session.save_path = \"%s\"|' %s"
+        % (php_ini, php_ini, path_esc, php_ini)
+    )
+    return run_bash(script)
+
+
+def write_redis_conf(content):
+    os.makedirs("/home/xui_bin/redis", exist_ok=True)
+    with io.open("/home/xui_bin/redis/redis.conf", "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def ensure_systemd_unit(path="/etc/systemd/system/xuione.service"):
+    with io.open(path, "w", encoding="utf-8") as f:
+        f.write(rSystemd)
+    run(
+        "sudo chmod +x /home/xui_bin/service %s && "
+        "sudo systemctl daemon-reload && sudo systemctl enable xuione" % path
+    )
+
+
+def append_fstab(lines):
+    # Drop legacy Main streams ramdisk (main_install.php removes it)
+    run('sudo sed -i "/tmpfs \\/home\\/xui\\/content\\/streams /d" /etc/fstab')
+    fstab = open("/etc/fstab").read()
+    with io.open("/etc/fstab", "a", encoding="utf-8") as f:
+        for line in lines:
+            if line.split()[1] not in fstab:
+                f.write("\n" + line)
+    run("sudo mkdir -p /home/xui_lb/content/streams /home/xui/tmp /home/xui_lb/tmp")
+
+
+def configure_local_host(redis_conf, php_session_path, extra_ips=None):
+    append_fstab(FSTAB_RAMDISKS)
+    ensure_systemd_unit()
+    run("sudo modprobe ip_conntrack 2>/dev/null || true")
+    with io.open("/etc/sysctl.conf", "w", encoding="utf-8") as f:
+        f.write(rSysCtl)
+    run("sudo sysctl -p >/dev/null 2>&1")
+    write_config("/home/xui/config/sysctl.on", "")
+    write_redis_conf(redis_conf)
+    configure_php_sessions(php_session_path)
+    run('sudo sed -i "s/systemd//g" /etc/nsswitch.conf')
+    tune_system_limits()
+    write_lb_whitelist(extra_ips)
+
+
+def clean_apt():
+    cmds = [
+        "systemctl stop unattended-upgrades.service apt-daily.service apt-daily-upgrade.service 2>/dev/null || true",
+        "pkill -9 apt apt-get dpkg unattended-upgrade 2>/dev/null || true",
+        "rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock /var/lib/apt/lists/lock",
+        "dpkg --configure -a || true",
+        "apt-get clean && apt-get autoclean -y && apt-get autoremove -y",
+        "apt-get update --fix-missing -y",
+    ]
+    for cmd in cmds:
+        run("sudo " + cmd)
+
+
+def remove_conflicting_web():
+    """Stop/remove system apache/nginx like main_install.php."""
+    script = (
+        "export DEBIAN_FRONTEND=noninteractive; "
+        "systemctl stop apache2 nginx 2>/dev/null || true; "
+        "systemctl disable apache2 nginx 2>/dev/null || true; "
+        "timeout 120 apt-get -y remove apache2 nginx 2>/dev/null || true; "
+        "rm -f /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock "
+        "/var/lib/dpkg/lock /var/lib/apt/lists/lock"
+    )
+    return run_bash(script)
+
+
+def debconf_iptables():
+    script = (
+        "echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections; "
+        "echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections"
+    )
+    return run_bash(script)
+
+
+def calculate_mysql_params():
+    try:
+        with open("/proc/meminfo") as f:
+            total_ram_mb = next(int(l.split()[1]) // 1024 for l in f if l.startswith("MemTotal:"))
+    except Exception:
+        total_ram_mb = 8192
+    cpu_cores = os.cpu_count() or 1
+    pool_mb = min(int(total_ram_mb * 0.45), 49152)
+    reserved_mb = max(4096, int(total_ram_mb * 0.30))
+    per_conn, cap, backlog_cap = 8, 2000, 512
+    pool_gb = max(1, pool_mb // 1024)
+    max_conn = max(500, min((total_ram_mb - pool_mb - reserved_mb) // per_conn, cap))
+    max_conn = (max_conn // 50) * 50
+    log_size = "512M" if total_ram_mb < 16384 else ("1G" if total_ram_mb < 32768 else "2G")
+    return {
+        "mysql_port": 3306,
+        "max_connections": max_conn,
+        "back_log": min(max(max_conn // 2, 50), backlog_cap),
+        "thread_cache_size": max_conn,
+        "thread_pool_size": max(1, min(cpu_cores, 64)),
+        "thread_pool_max_threads": min(max(max(1, min(cpu_cores, 64)) * 32, 256), 1024),
+        "open_files_limit": min(max(max_conn * 3 + 2000, 4096), 65535),
+        "innodb_open_files": min(max(pool_gb * 100, 2000), 65535),
+        "max_connect_errors": min(max(1000, max_conn * 2), 10000),
+        "table_open_cache": min(max(4000, max_conn * 2), 8000),
+        "table_definition_cache": max(2000, min(max(4000, max_conn * 2), 8000) // 2),
+        "innodb_buffer_pool_size": "%dG" % pool_gb,
+        "innodb_buffer_pool_instances": min(max(1, pool_gb), 16),
+        "innodb_io_threads": min(max(cpu_cores, 4), 16),
+        "innodb_io_capacity": 8000,
+        "innodb_io_capacity_max": 16000,
+        "innodb_log_file_size": log_size,
+        "innodb_log_buffer_size": "32M" if total_ram_mb < 16384 else "64M",
+    }
+
+
+def write_mariadb_config(params):
+    os.makedirs("/etc/systemd/system/mariadb.service.d", exist_ok=True)
+    with io.open("/etc/systemd/system/mariadb.service.d/limits.conf", "w", encoding="utf-8") as f:
+        f.write("[Service]\nLimitNOFILE=100000\n")
+    target = "/etc/mysql/mariadb.cnf"
+    if os.path.islink("/etc/mysql/my.cnf"):
+        target = os.path.realpath("/etc/mysql/my.cnf") or target
+    elif os.path.exists("/etc/mysql/my.cnf"):
+        target = "/etc/mysql/my.cnf"
+    with io.open(target, "w", encoding="utf-8") as f:
+        f.write(rMySQLCnfTemplate.format(**params))
+    run("sudo systemctl daemon-reload")
+    run("sudo systemctl restart mariadb || sudo service mariadb restart")
+
+
+def ensure_admin_code(mysql_extra):
+    code_dir = "/home/xui_bin/nginx/conf/codes/"
+    has_admin = None
+    if os.path.isdir(code_dir):
+        for name in os.listdir(code_dir):
+            if name.endswith(".conf") and "/home/xui/admin" in open(code_dir + name).read():
+                has_admin = name
+                break
+    if has_admin:
+        return has_admin.split(".")[0]
+    code = generate(8)
+    run('sudo mysql -u root%s -e "USE xui; INSERT INTO access_codes(code, type, enabled, groups) VALUES(\'%s\', 0, 1, \'[1]\');"' % (mysql_extra, code))
+    template = open(code_dir + "template").read()
+    template = template.replace("#WHITELIST#", "").replace("#TYPE#", "admin").replace("#CODE#", code).replace("#BURST#", "500")
+    write_config(code_dir + code + ".conf", template)
+    return code
+
+
+def reset_tree():
+    """Match install_common.php CLEANUP_SCRIPT."""
+    script = r"""
+set +e
+echo "Stopping services..."
+systemctl stop xuione 2>/dev/null || true
+killall -9 -u xui 2>/dev/null || true
+pkill -9 -u xui 2>/dev/null || true
+killall -9 nginx 2>/dev/null || true
+sleep 1
+for mp in /home/xui_lb/content/streams /home/xui_lb/tmp /home/xui/tmp /home/xui/content/streams; do
+  umount -l "$mp" 2>/dev/null || true
+done
+echo "Removing /home/xui /home/xui_lb /home/xui_bin..."
+rm -rf /home/xui /home/xui_lb /home/xui_bin
+mkdir -p /home/xui /home/xui_lb /home/xui_bin
+chown xui:xui /home/xui /home/xui_lb /home/xui_bin 2>/dev/null || true
+echo "CLEANUP_DONE"
+"""
+    return run_bash(script)
+
+
+if __name__ == "__main__":
+    os.chdir(rPath)
+
+    print("XUI bootstrap installer")
+    print("Installs Main + DB + LB on this server.\n")
+
+    while True:
+        server_ip = input("This server IP: ").strip()
+        try:
+            ipaddress.ip_address(server_ip)
+            break
+        except ValueError:
+            print("Invalid IP, try again.")
+
+    while True:
+        port_in = input("MySQL port [3306]: ").strip()
+        mysql_port = 3306 if not port_in else int(port_in)
+        if 1 <= mysql_port <= 65535:
+            break
+        print("Port must be 1-65535.")
+
+    version = run("lsb_release -sr", capture=True).stdout.strip()
+    if version not in rVersions:
+        printc("Unsupported OS (need Ubuntu 20.04/22.04)", col.FAIL)
+        sys.exit(1)
+
+    for archive, _, _ in ARCHIVES:
+        if not os.path.isfile(os.path.join(rPath, archive)):
+            printc("Missing %s in %s" % (archive, rPath), col.FAIL)
+            sys.exit(1)
+
+    printc("XUI install", col.OKGREEN, 1)
+    username = generate()
+    password = generate()
+    redis_password = generate(64)
+    redis_conf = rRedisConfig.replace("#PASSWORD#", redis_password)
+    try:
+        with open("/sys/class/dmi/id/product_uuid") as uuid_file:
+            uuid_key = uuid_file.read().strip().lower()
+    except (OSError, IOError):
+        uuid_key = ""
+    if not uuid_key:
+        uuid_key = str(uuid.uuid4())
+
+    reset_tree()
+
+    printc("Preparing system")
+    clean_apt()
+    remove_conflicting_web()
+    debconf_iptables()
+
+    run("sudo apt-get update")
+    run("sudo DEBIAN_FRONTEND=noninteractive apt-get -yq install software-properties-common")
+    run("sudo curl -sS https://supplychain.mariadb.com/mariadb-keyring-2019.gpg -o /usr/share/keyrings/mariadb-keyring.gpg")
+    run(
+        "echo 'deb [arch=amd64,arm64,ppc64el signed-by=/usr/share/keyrings/mariadb-keyring.gpg] "
+        "http://deb.mariadb.org/10.6/ubuntu %s main' | sudo tee /etc/apt/sources.list.d/mariadb.list"
+        % rVersions[version]
+    )
+    run("sudo systemctl stop mariadb mysql 2>/dev/null || true")
+    run("sudo apt-get purge -y mariadb-server mariadb-client mariadb-common && sudo apt-get autoremove -y")
+    run("sudo rm -rf /var/lib/mysql /var/log/mysql")
+    run("sudo apt-get update")
+
+    for package in rPackages:
+        printc("Installing %s" % package)
+        run(
+            "sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a "
+            "apt-get -yq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install %s"
+            % package
+        )
+
+    if run("getent passwd xui", check=False).returncode != 0:
+        run("sudo adduser --system --shell /bin/false --group --disabled-login xui")
+    for path in ("/home/xui", "/home/xui_lb", "/home/xui_bin"):
+        os.makedirs(path, exist_ok=True)
+
+    printc("Installing XUI stack")
+    extract_stack()
+
+    printc("Configuring MySQL")
+    mysql_params = calculate_mysql_params()
+    mysql_params["mysql_port"] = mysql_port
+    write_mariadb_config(mysql_params)
+    time.sleep(2)
+
+    mysql_extra = ""
+    if run("mysql -u root -e \"SELECT VERSION();\"", check=False).returncode != 0:
+        while True:
+            mysql_extra = " -p%s" % input("Root MySQL password: ")
+            if run("mysql -u root%s -e \"SELECT VERSION();\"" % mysql_extra, check=False).returncode == 0:
+                break
+            printc("Invalid password", col.FAIL)
+
+    for q in (
+        'DROP DATABASE IF EXISTS xui; CREATE DATABASE xui;',
+        'DROP DATABASE IF EXISTS xui_migrate; CREATE DATABASE xui_migrate;',
+    ):
+        run('sudo mysql -u root%s -e "%s"' % (mysql_extra, q))
+    run('sudo mysql -u root%s xui < "%s/database.sql"' % (mysql_extra, rPath))
+
+    for host in ("localhost", "127.0.0.1"):
+        run("sudo mysql -u root%s -e \"CREATE USER '%s'@'%s' IDENTIFIED BY '%s';\"" % (mysql_extra, username, host, password))
+        run("sudo mysql -u root%s -e \"GRANT ALL PRIVILEGES ON *.* TO '%s'@'%s' IDENTIFIED BY '%s' WITH GRANT OPTION;\"" % (mysql_extra, username, host, password))
+    run('sudo mysql -u root%s -e "FLUSH PRIVILEGES;"' % mysql_extra)
+    run(
+        "sudo mysql -u root%s -e \"USE xui; UPDATE settings SET redis_password='%s', redis_handler=1;\""
+        % (mysql_extra, redis_password.replace("'", "\\'"))
+    )
+
+    pools = os.cpu_count() or 4
+    run(
+        "sudo mysql -u root%s -e 'USE xui; INSERT INTO `servers` (`id`, `server_type`, `xui_version`, "
+        "`server_name`, `domain_name`, `server_ip`, `private_ip`, `is_main`, `enabled`, `parent_id`, "
+        "`http_broadcast_port`, `https_broadcast_port`, `http_ports_add`, `https_ports_add`, `total_clients`, "
+        "`network_interface`, `status`, `enable_geoip`, `geoip_countries`, `last_check_ago`, `server_hardware`, "
+        "`total_services`, `persistent_connections`, `rtmp_port`, `geoip_type`, `isp_names`, `isp_type`, "
+        "`enable_isp`, `network_guaranteed_speed`, `timeshift_only`, `whitelist_ips`, `watchdog_data`, "
+        "`video_devices`, `audio_devices`, `gpu_info`, `interfaces`, `random_ip`, `enable_proxy`, `enable_https`, "
+        "`certbot_renew`, `certbot_ssl`, `uuid`, `use_disk`, `last_status`, `time_offset`, `ping`, "
+        "`requests_per_second`, `xui_revision`, `php_version`) VALUES "
+        "(1, %d, \"1.6.0\", \"Main + DB Server\", \"\", \"%s\", \"\", 1, 1, 0, 80, 443, NULL, NULL, 1000, "
+        "\"auto\", 1, 0, \"[]\", 0, NULL, %d, 0, 8880, \"low_priority\", \"\", \"low_priority\", 0, 1000, 0, "
+        "\"[\\\"127.0.0.1\\\"]\", NULL, \"[]\", \"[]\", \"[]\", \"[\\\"eth0\\\"]\", 0, 0, 0, 0, NULL, NULL, 0, 0, "
+        "0, 0, 0, NULL, 74);'" % (mysql_extra, ROLE_MAIN_DB, server_ip, pools)
+    )
+    main_ini = rConfig % ("127.0.0.1", 1, uuid_key, mysql_port, username, password)
+    lb_ini = rLBConfig % ("127.0.0.1", 1, uuid_key)
+
+    write_config("/home/xui/config/new_config.ini", main_ini)
+    write_config("/home/xui_lb/config/new_config.ini", lb_ini)
+
+    printc("Configuring host")
+    redis_session = "tcp://127.0.0.1:%d?auth=%s" % (rRedisPort, redis_password)
+    configure_local_host(redis_conf, redis_session, [server_ip])
+    prepare_php_fpm_stub(pools)
+
+    admin_code = ensure_admin_code(mysql_extra)
+
+    # Match main_install.php: generate PHP-FPM pools before starting xuione.
+    # Otherwise start_fpm runs daemons.sh against missing main_*.conf and the unit fails.
+    printc("Generating PHP-FPM pools")
+    run_startup("main")
+    run_startup("lb")
+
+    printc("Starting services")
+    if not start_xui_stack():
+        printc("xuione failed to start — check: systemctl status xuione", col.FAIL)
+    time.sleep(10)
+
+    cred_path = os.path.join(rPath, "credentials.txt")
+    with io.open(cred_path, "w", encoding="utf-8") as f:
+        f.write("MySQL Username: %s\nMySQL Password: %s\nMySQL Port: %s\nUUID: %s\n" % (username, password, mysql_port, uuid_key))
+        f.write("Redis Password: %s\nRedis Port: %s\n" % (redis_password, rRedisPort))
+
+    printc("Installation completed!", col.OKGREEN, 1)
+    printc("Continue setup: http://%s/%s" % (get_ip(), admin_code))
+    printc("Credentials saved to: %s" % cred_path)
+    print("Move credentials.txt somewhere safe.")

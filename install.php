@@ -2,7 +2,6 @@
 
 $allowed_ips = [
     '92.246.87.152',
-    '172.110.221.246',
 ];
 
 function ip_in_cidr(string $ip, string $cidr): bool
@@ -49,10 +48,10 @@ $client_ip = get_client_ip();
 
 if (!in_array($client_ip, $allowed_ips, true)) {
     http_response_code(403);
-    exit('Forbidden');
+    exit('You are wrong!');
 }
 
-$file = '/home/xui_install.tar.gz';
+$file = '/home/install/packages/xui_install.tar.gz';
 
 if (file_exists($file)) {
     header('Content-Description: File Transfer');

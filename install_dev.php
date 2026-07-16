@@ -41,10 +41,10 @@ foreach ($headers as $key => $value) {
 
 if ($provided === '' || !hash_equals($AUTH_KEY, $provided)) {
     http_response_code(401);
-    exit('Unauthorized');
+    exit('You are wrong!');
 }
 
-$file = '/home/xui_install_dev.tar.gz';
+$file = '/home/install/packages/xui_install_dev.tar.gz';
 
 if (file_exists($file)) {
     header('Content-Description: File Transfer');
